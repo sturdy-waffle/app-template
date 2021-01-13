@@ -1,0 +1,193 @@
+version: 2.1
+
+orbs:
+  cloudsmith: cloudsmith/cloudsmith@1.0.1
+  slack: circleci/slack@4.2.0
+
+parameters:
+  promote-release:
+    default: false
+    type: boolean
+  promote-source:
+    default: ""
+    type: string
+  promote-scan-results:
+    default: ""
+    type: string
+  promote-url:
+    default: ""
+    type: string
+  promote-version:
+    default: "0.0.0"
+    type: string
+
+jobs:
+  build-debian-package:
+    docker:
+      - image: docker.cloudsmith.io/sturdy-waffle/build-images/debian-build:latest
+        auth:
+          username: $IMAGES_REGISTRY_USERNAME
+          password: $IMAGES_REGISTRY_PASSWORD
+
+    steps:
+      - checkout
+      - run:
+          name: Write Version File
+          command: echo "__version__ = \"$CIRCLE_TAG\"" > sturdy_waffle/_version.py
+      - run:
+          name: Install fpm
+          command: gem install fpm
+      - run:
+          name: Build Debian Package
+          command: fpm -s python -t deb --python-package-name-prefix=python3 .
+      - persist_to_workspace:
+          root: . 
+          paths:
+            - "*.deb"
+  publish-debian-package:
+    parameters:
+      repository:
+        description: The Cloudsmith repository to publish to
+        type: string
+      distribution:
+        description: The distribution to publish this package as
+        type: string
+    docker:
+      - image: docker.cloudsmith.io/sturdy-waffle/build-images/circleci-python:3.7
+        auth:
+          username: $IMAGES_REGISTRY_USERNAME
+          password: $IMAGES_REGISTRY_PASSWORD
+
+    steps:
+      - cloudsmith/ensure-api-key
+      - cloudsmith/install-cli
+      - attach_workspace:
+          at: /tmp/workspace
+      - cloudsmith/publish:
+          cloudsmith-repository: <<parameters.repository>>
+          package-distribution: <<parameters.distribution>> 
+          package-format: deb 
+          package-path: "/tmp/workspace/*.deb"
+  promote-sturdy-waffle:
+    docker:
+      - image: docker.cloudsmith.io/sturdy-waffle/build-images/circleci-python:3.7
+        auth:
+          username: $IMAGES_REGISTRY_USERNAME
+          password: $IMAGES_REGISTRY_PASSWORD
+    steps:
+      - cloudsmith/ensure-api-key
+      - cloudsmith/install-cli
+      - run:
+          name: Install jq
+          command: sudo apt-get install -y jq
+      - run:
+          name: Confirm Vulnerability Scan
+          command: |
+            export VULNERABILITIES=`curl -H "X-Api-Key: $CLOUDSMITH_API_KEY" << pipeline.parameters.promote-scan-results >> | jq '.[0].num_vulnerabilities'`
+            if [ $VULNERABILITIES -gt 0 ]; then
+              exit 1
+            fi
+      - run:
+          name: Promote Image 
+          command: cloudsmith promote -y << pipeline.parameters.promote-source >> releases
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Promotion Failed :red_circle:",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Version*: << pipeline.parameters.promote-version >>"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Reason*: Vulnerabilities found in image"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Results"
+                      },
+                      "url": "<< pipeline.parameters.promote-url >>#security"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+              {
+                 "type": "header",
+                 "text": {
+                   "type": "plain_text",
+                   "text": "Promotion Successful :large_green_circle:",
+                   "emoji": true
+                 }
+               },
+               {
+                 "type": "section",
+                 "text": {
+                   "type": "mrkdwn",
+                   "text": "*Version*: << pipeline.parameters.promote-version >>"
+                 }
+               }
+             ]
+            }
+
+workflows:
+  build-and-release-debian:
+    unless: << pipeline.parameters.promote-release >>
+    jobs:
+      - build-debian-package:
+          context: cloudsmith-credentials
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /.*/
+      - publish-debian-package:
+          context: cloudsmith-credentials
+          repository: sturdy-waffle/app
+          distribution: ubuntu/focal
+          requires:
+            - build-debian-package
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /.*/
+  promote-app:
+    when: << pipeline.parameters.promote-release >>
+    jobs:
+      - slack/on-hold:
+          context: slack-credentials
+      - await-confirmation:
+          requires:
+            - slack/on-hold
+          type: approval
+      - promote-sturdy-waffle:
+          context:
+            - cloudsmith-credentials
+            - slack-credentials
+          requires:
+            - await-confirmation
